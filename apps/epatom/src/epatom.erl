@@ -1,32 +1,75 @@
+%%%-------------------------------------------------------------------
+%%% @author Artem Golovinsky <artemgolovinsky@gmail.com>
+%%% @copyright (C) 2012, Artem Golovinsky
+%%% @doc Module for converting Atom XML to erlang-friendly format.
+%%%      Filtering by published/updated name. It means, entry will be 
+%%%      returned if entry published/updated date > filter entry 
+%%%      published/updated date
+%%% @end
+%%%-------------------------------------------------------------------
 -module(epatom).
 
--export([parse/1, parse/2, from_file/1, from_file/2]).
+-export([parse/1, parse/2]).
+
+-include("epatom.hrl").
 
 -define(ATOM_XMLNS,"http://www.w3.org/2005/Atom"). 
 -define(FORMAT, <<"%Y-%m-%dT%H:%M:%S">>).
 
--record(state, {filter      = undefined,
-		skip_entry  = false,
+%%%-------------------------------------------------------------------
+%%% Type specification
+%%%-------------------------------------------------------------------
+
+-type date()      :: binary()
+		   | string()
+		   | calendar:datetime()
+		   | undefined.
+
+-type date_crt()  :: published 
+		   | updated.
+
+-type filter()    :: {date_crt(), date()} 
+		   | undefined.
+
+-type atom_xml()  :: binary() 
+		   | string().
+
+-type error()     :: not_atom 
+		   | wrong_date_format.
+
+%%%------------------------------------------------------------------  
+
+-record(state, {filter      = undefined :: filter(),
+		skip_entry  = false     :: boolean(),
 		stack       = []}).
-		
+%%%------------------------------------------------------------------
 
-from_file(Fname) ->
-    from_file(Fname, undefined).
-
-from_file(Fname, Updated) ->
-    case file:read_file(Fname) of
-	{ok, Content} ->
-	    parse(Content, Updated);
-	Error ->
-	    Error
-    end.
-
+%% @doc Parse Atom Format string fully, without
+%%      filtering by published/updated date.
+%%      @equiv parse(Xml, undefined)
+%% @end
+-spec parse(atom_xml()) -> {ok, [element()]}
+			 | {error, error()}.
 parse(Xml) ->
     parse(Xml, undefined).
 
+%% @doc Parse Atom Format string with filtering by 
+%%      published/updated field. Entries are containing
+%%      published/updated date MORE than in Filter 
+%%      will be returned.
+%%      See @see epatom_examples
+%% @end
+-spec parse(atom_xml(), filter()) -> {ok, [element()]}
+				   | {error, error()}.
 parse(Xml, Filter) ->
     parse2(Xml, Filter).
 
+%% @private
+%% @doc Helper function to execute parsing by erlsom
+%%      and catch results. 
+%% @end
+-spec parse2(atom_xml(), filter()) -> {ok, [element()]}
+				   | {error, error()}.
 parse2(Xml, Filter)->
     State = #state{filter      = Filter,
 		   skip_entry  = false,
@@ -38,7 +81,9 @@ parse2(Xml, Filter)->
 	_:Reason -> {error, Reason}
     end.
 
-
+%% @private
+%% @doc Helper function. Callback for erlsom sax parser.
+%% @end
 do_parse({startElement,Ns,"feed",_,_Attrs},_State) when Ns /= ?ATOM_XMLNS -> 
     throw(not_atom);
 do_parse({startElement,_, Element,_,Attrs},State) ->    
@@ -50,42 +95,61 @@ do_parse({characters, Ch}, State)->
 do_parse(_, State)->
     State.
 
+%% @private
+%% @doc Helper function. Adding new element with attributes 
+%%      to stack or skip entry if it does not meet to filter.
+%% @end
 make_start(_Name, _Attrs, #state{skip_entry=true} = State) ->
     State;
 make_start(Name, Attrs, #state{stack=Stack} = State) ->
-    State#state{stack=[{Name, Attrs,[], undefined}|Stack]};
+    State#state{stack=[#element{name  = Name, 
+				attrs = Attrs}|Stack]};
 make_start(_Name, _Attrs, State) ->
     State.
 
-
+%% @private
+%% @doc Helper function. Finishing element processing and
+%%      put current finished record to child list of parent record.
+%% @end
 make_end(entry, #state{skip_entry=true} = State) ->
     State#state{skip_entry=false};
-make_end(ElName,#state{stack=[{ElName, Attrs, Childs, Value}]} = State) ->
-    State#state{stack=[{ElName, Attrs, lists:reverse(Childs), Value}]};
-make_end(ElName, #state{stack=[{ElName, Attrs, Childs, Value}|Stack]} = State) ->
-    [{ElName1, Attrs1, Childs1, Value1} | TStack] = Stack,
-    State#state{stack=[{ElName1, Attrs1, [{ElName, Attrs, lists:reverse(Childs), Value}|Childs1], Value1}|TStack]};
+make_end(ElName,#state{stack=[#element{name=ElName,childs=Childs} = El]} = State) ->
+    State#state{stack=[El#element{childs=lists:reverse(Childs)}]};
+make_end(ElName, #state{stack=[#element{name=ElName,childs=Childs}=EndEl|Stack]} = State) ->
+    [#element{childs=ParChilds} = ParentEl|TStack] = Stack,
+    NewParChilds = [EndEl#element{childs=lists:reverse(Childs)}|ParChilds],
+    State#state{stack=[ParentEl#element{childs=NewParChilds}|TStack]};
 make_end(_, State) ->
     State.
 
+%% @private
+%% @doc Helper function. Putting text node of element to element record.
+%% @end
 make_text(_Text, #state{skip_entry=true} = State) ->
     State;
 make_text(Text, #state{filter={Param, Criteria},
-		       stack=[{Param, Attrs, Childs,_},
-			      {entry, Attrs1, Childs1, Value1}|TStack]} = State) when Param == updated;
-										      Param == published ->
+		       stack=[#element{name=Param} = UpdElem,
+			      #element{name=entry} = EntElem|TStack]} = State) when Param == updated;
+										    Param == published ->
    case is_date_more(Text, Criteria) of
        false -> State#state{skip_entry=true, stack=TStack};
-       true  -> State#state{stack=[{Param, Attrs, Childs, Text}|[{entry, Attrs1, Childs1, Value1}|TStack]]}
+       true  -> State#state{stack=[UpdElem#element{text=Text}|[EntElem|TStack]]}
    end;	   
-make_text(Text, #state{stack=[{ElName, Attrs, Childs, _Value}|TStack]} = State) ->
-    State#state{stack=[{ElName, Attrs, Childs, Text}|TStack]}.
+make_text(Text, #state{stack=[Elem|TStack]} = State) ->
+    State#state{stack=[Elem#element{text=Text}|TStack]}.
 
+%% @private
+%% @doc Helper function. Getting simple attribute tuple
+%%      from erlsom attribute format.
+%% @end
 make_attrs(AttrList) ->
     [{to_atom(Attr), Value} || {attribute,Attr,_,_,Value} <- AttrList].
 
-
-
+%% @private
+%% @doc Helper function. Convert name of element/attribute to atom.
+%%      Only names in http://www.w3.org/2005/Atom namespace will be 
+%%      converted. String will be returned for others names.
+%% @end
 to_atom("feed") ->        feed;
 to_atom("author") ->      author;
 to_atom("category") ->    category;
@@ -100,29 +164,29 @@ to_atom("subtitle") ->    subtitle;
 to_atom("title") ->       title;
 to_atom("updated") ->     updated;
 to_atom("published") ->   published;
-to_atom("rel") ->         rel;
+to_atom("rel") ->         rel; 
 to_atom("content") ->     content;
 to_atom("source") ->      source;
 to_atom("summary") ->     summary;
 to_atom("entry") ->       entry;
-to_atom("type") ->        type;
-to_atom("src") ->         src;
-to_atom("term") ->        term;
+to_atom("type") ->        type; 
+to_atom("src") ->         src; 
+to_atom("term") ->        term; 
 to_atom("scheme") ->      scheme;
 to_atom("label") ->       label;
 to_atom("uri") ->         uri;
 to_atom("version") ->     version;
-to_atom("href") ->        href;
-to_atom("hreflang") ->    hreflang;
-to_atom("length") ->      length;
+to_atom("href") ->        href;  
+to_atom("hreflang") ->    hreflang; 
+to_atom("length") ->      length; 
 to_atom("name") ->        name;
 to_atom("email") ->       email;
-to_atom("height") ->      height;
-to_atom("width")  ->      widht;
-to_atom("image") ->       image;
 to_atom(String) ->        String.
     
-    
+%% @private
+%% @doc Helper function. Comparing of two dates.
+%%      'true' if FirstDate >= SecondDate.
+%% @end    
 is_date_more(FirstDate, SecondDate) ->
     FirstDateT  = to_erl_date(FirstDate),
     SecondDateT = to_erl_date(SecondDate),
@@ -131,18 +195,20 @@ is_date_more(FirstDate, SecondDate) ->
 	_ -> false
     end.
 
+%% @private
+%% @doc Helper function. Converting date in binary/string
+%%      format to calendar:datetime() format. 
+%% @end  
 to_erl_date(Date) when is_tuple(Date) ->
     Date;
+to_erl_date(Date) when is_list(Date) ->
+    to_erl_date(list_to_binary(Date));
 to_erl_date(Date) when is_binary(Date) ->
     <<DateB:19/binary, _/binary>>  = Date,
     {ok, DateT} = tempo:parse(?FORMAT, {datetime, DateB}),
     DateT;
-to_erl_date([A1,A2,A3,A4,A5,A6,A7,A8,A9,A10,A11,A12,A13,A14,A15,A16,A17,A18,A19|_]) ->
-    DateB = list_to_binary([A1,A2,A3,A4,A5,A6,A7,A8,A9,A10,A11,A12,A13,A14,A15,A16,A17,A18,A19]),
-    {ok, DateT} = tempo:parse(?FORMAT, {datetime, DateB}),
-    DateT;
 to_erl_date(Date) ->
-    throw({error, {wrong_date_fromat, Date}}).
+    throw({wrong_date_format, Date}).
     
 
     
