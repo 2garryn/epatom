@@ -1,3 +1,3 @@
 #!/bin/sh
 
-exec erl -pa apps/epatom/ebin deps/*/ebin -boot start_sasl 
+exec erl -pa ./ebin deps/*/ebin -boot start_sasl 
